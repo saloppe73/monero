@@ -137,7 +137,7 @@ namespace cryptonote
     CHECK_AND_ASSERT_MES_CC( context.m_callback_request_count > 0, false, "false callback fired, but context.m_callback_request_count=" << context.m_callback_request_count);
     --context.m_callback_request_count;
 
-    if(context.m_state == cryptonote_connection_context::state_synchronizing)
+    if(context.m_state == cryptonote_connection_context::state_synchronizing && context.m_last_request_time == boost::posix_time::not_a_date_time)
     {
       NOTIFY_REQUEST_CHAIN::request r = {};
       context.m_needed_objects.clear();
@@ -549,6 +549,7 @@ namespace cryptonote
       }      
 
       std::vector<tx_blob_entry> have_tx;
+      have_tx.reserve(new_block.tx_hashes.size());
 
       // Instead of requesting missing transactions by hash like BTC, 
       // we do it by index (thanks to a suggestion from moneromooo) because
@@ -557,6 +558,7 @@ namespace cryptonote
       // Also, remember to pepper some whitespace changes around to bother
       // moneromooo ... only because I <3 him. 
       std::vector<uint64_t> need_tx_indices;
+      need_tx_indices.reserve(new_block.tx_hashes.size());
         
       transaction tx;
       crypto::hash tx_hash;
@@ -829,6 +831,7 @@ namespace cryptonote
     }
 
     std::vector<crypto::hash> txids;
+    txids.reserve(b.tx_hashes.size());
     NOTIFY_NEW_FLUFFY_BLOCK::request fluffy_response;
     fluffy_response.b.block = t_serializable_object_to_blob(b);
     fluffy_response.current_blockchain_height = arg.current_blockchain_height;
@@ -2189,6 +2192,7 @@ skip:
           if (span.second > 0)
           {
             is_next = true;
+            req.blocks.reserve(hashes.size());
             for (const auto &hash: hashes)
             {
               req.blocks.push_back(hash);
@@ -2247,6 +2251,7 @@ skip:
         if (span.second > 0)
         {
           is_next = true;
+          req.blocks.reserve(hashes.size());
           for (const auto &hash: hashes)
           {
             req.blocks.push_back(hash);
@@ -2280,6 +2285,7 @@ skip:
             return false;
           }
 
+          req.blocks.reserve(req.blocks.size() + span.second);
           for (size_t n = 0; n < span.second; ++n)
           {
             req.blocks.push_back(context.m_needed_objects[n].first);
@@ -2570,17 +2576,6 @@ skip:
       return 1;
     }
 
-    std::unordered_set<crypto::hash> hashes;
-    for (const auto &h: arg.m_block_ids)
-    {
-      if (!hashes.insert(h).second)
-      {
-        LOG_ERROR_CCONTEXT("sent duplicate block, dropping connection");
-        drop_connection(context, true, false);
-        return 1;
-      }
-    }
-
     uint64_t n_use_blocks = m_core.prevalidate_block_hashes(arg.start_height, arg.m_block_ids, arg.m_block_weights);
     if (n_use_blocks == 0 || n_use_blocks + HASH_OF_HASHES_STEP <= arg.m_block_ids.size())
     {
@@ -2590,20 +2585,77 @@ skip:
     }
 
     context.m_needed_objects.clear();
+    context.m_needed_objects.reserve(arg.m_block_ids.size());
     uint64_t added = 0;
     std::unordered_set<crypto::hash> blocks_found;
+    bool first = true;
+    bool expect_unknown = false;
     for (size_t i = 0; i < arg.m_block_ids.size(); ++i)
     {
       if (!blocks_found.insert(arg.m_block_ids[i]).second)
       {
         LOG_ERROR_CCONTEXT("Duplicate blocks in chain entry response, dropping connection");
-        drop_connection(context, true, false);
+        drop_connection_with_score(context, 5, false);
         return 1;
+      }
+      int where;
+      const bool have_block = m_core.have_block_unlocked(arg.m_block_ids[i], &where);
+      if (first)
+      {
+        if (!have_block && !m_block_queue.requested(arg.m_block_ids[i]) && !m_block_queue.have(arg.m_block_ids[i]))
+        {
+          LOG_ERROR_CCONTEXT("First block hash is unknown, dropping connection");
+          drop_connection_with_score(context, 5, false);
+          return 1;
+        }
+        if (!have_block)
+          expect_unknown = true;
+      }
+      if (!first)
+      {
+        // after the first, blocks may be known or unknown, but if they are known,
+        // they should be at the same height if on the main chain
+        if (have_block)
+        {
+          switch (where)
+          {
+            default:
+            case HAVE_BLOCK_INVALID:
+              LOG_ERROR_CCONTEXT("Block is invalid or known without known type, dropping connection");
+              drop_connection(context, true, false);
+              return 1;
+            case HAVE_BLOCK_MAIN_CHAIN:
+              if (expect_unknown)
+              {
+                LOG_ERROR_CCONTEXT("Block is on the main chain, but we did not expect a known block, dropping connection");
+                drop_connection_with_score(context, 5, false);
+                return 1;
+              }
+              if (m_core.get_block_id_by_height(arg.start_height + i) != arg.m_block_ids[i])
+              {
+                LOG_ERROR_CCONTEXT("Block is on the main chain, but not at the expected height, dropping connection");
+                drop_connection_with_score(context, 5, false);
+                return 1;
+              }
+              break;
+            case HAVE_BLOCK_ALT_CHAIN:
+              if (expect_unknown)
+              {
+                LOG_ERROR_CCONTEXT("Block is on the main chain, but we did not expect a known block, dropping connection");
+                drop_connection_with_score(context, 5, false);
+                return 1;
+              }
+              break;
+          }
+        }
+        else
+          expect_unknown = true;
       }
       const uint64_t block_weight = arg.m_block_weights.empty() ? 0 : arg.m_block_weights[i];
       context.m_needed_objects.push_back(std::make_pair(arg.m_block_ids[i], block_weight));
       if (++added == n_use_blocks)
         break;
+      first = false;
     }
     context.m_last_response_height -= arg.m_block_ids.size() - n_use_blocks;
 
@@ -2634,6 +2686,7 @@ skip:
     std::vector<std::pair<epee::net_utils::zone, boost::uuids::uuid>> fullConnections, fluffyConnections;
     m_p2p->for_each_connection([this, &exclude_context, &fullConnections, &fluffyConnections](connection_context& context, nodetool::peerid_type peer_id, uint32_t support_flags)
     {
+      // peer_id also filters out connections before handshake
       if (peer_id && exclude_context.m_connection_id != context.m_connection_id && context.m_remote_address.get_zone() == epee::net_utils::zone::public_)
       {
         if(m_core.fluffy_blocks_enabled() && (support_flags & P2P_SUPPORT_FLAG_FLUFFY_BLOCKS))
@@ -2794,12 +2847,15 @@ skip:
         epee::string_tools::to_string_hex(context.m_pruning_seed) <<
         "), score " << score << ", flush_all_spans " << flush_all_spans);
 
-    if (score > 0)
-      m_p2p->add_host_fail(context.m_remote_address, score);
-
     m_block_queue.flush_spans(context.m_connection_id, flush_all_spans);
 
+    // copy since dropping the connection will invalidate the context, and thus the address
+    const auto remote_address = context.m_remote_address;
+
     m_p2p->drop_connection(context);
+
+    if (score > 0)
+      m_p2p->add_host_fail(remote_address, score);
   }
   //------------------------------------------------------------------------------------------------------------------------
   template<class t_core>

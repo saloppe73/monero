@@ -1,3 +1,5 @@
+#!/bin/bash -e
+
 # Copyright (c) 2014-2020, The Monero Project
 #
 # All rights reserved.
@@ -26,58 +28,48 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-if(APPLE)
-  if(DEPENDS)
-    list(APPEND EXTRA_LIBRARIES "-framework Foundation -framework ApplicationServices -framework AppKit -framework IOKit")
-  else()
-    find_library(IOKIT_LIBRARY IOKit)
-    mark_as_advanced(IOKIT_LIBRARY)
-    list(APPEND EXTRA_LIBRARIES ${IOKIT_LIBRARY})
-  endif()
-endif()
+# Include What You Use analyses the complexity of your header hierarchy and proposes optimisations.
+# User documentation:
+# https://github.com/include-what-you-use/include-what-you-use/blob/master/README.md
 
-set(cryptonote_basic_sources
-  account.cpp
-  connection_context.cpp
-  cryptonote_basic_impl.cpp
-  cryptonote_format_utils.cpp
-  difficulty.cpp
-  hardfork.cpp
-  miner.cpp)
+# Build variables
+PROG="include-what-you-use"
+PROG_SHORT="iwyu"
+DIR_BUILD="build/clang-$PROG_SHORT"
 
-set(cryptonote_basic_headers)
+RESULT="$PROG_SHORT-result.txt"
 
-set(cryptonote_basic_private_headers
-  account.h
-  account_boost_serialization.h
-  connection_context.h
-  cryptonote_basic.h
-  cryptonote_basic_impl.h
-  cryptonote_boost_serialization.h
-  cryptonote_format_utils.h
-  difficulty.h
-  hardfork.h
-  miner.h
-  tx_extra.h
-  verification_context.h)
+if hash "$PROG"; then
+	echo "Found: $PROG"
+else
+	echo "Couldn't find: $PROG"
+	echo "Please run the below command to install $PROG:"
+	echo "sudo apt install $PROG_SHORT"
+	exit 1
+fi
 
-monero_private_headers(cryptonote_basic
-  ${cryptonote_basic_private_headers})
-monero_add_library(cryptonote_basic
-  ${cryptonote_basic_sources}
-  ${cryptonote_basic_headers}
-  ${cryptonote_basic_private_headers})
-target_link_libraries(cryptonote_basic
-  PUBLIC
-    common
-    cncrypto
-    checkpoints
-    device
-    ${Boost_DATE_TIME_LIBRARY}
-    ${Boost_PROGRAM_OPTIONS_LIBRARY}
-    ${Boost_SERIALIZATION_LIBRARY}
-    ${Boost_FILESYSTEM_LIBRARY}
-    ${Boost_SYSTEM_LIBRARY}
-    ${Boost_THREAD_LIBRARY}
-  PRIVATE
-    ${EXTRA_LIBRARIES})
+mkdir -p "$DIR_BUILD" && cd "$DIR_BUILD"
+rm `find . -name "CMakeCache.txt"` || true
+
+UWYU_COMMAND="$PROG;-Xiwyu;any;-Xiwyu;iwyu;-Xiwyu;args" # Copy-pasted from the user docs.
+	
+cmake ../.. \
+-DCMAKE_C_COMPILER=clang \
+-DCMAKE_CXX_COMPILER=clang++ \
+-DUSE_CCACHE=ON \
+-DCMAKE_C_INCLUDE_WHAT_YOU_USE="$UWYU_COMMAND" \
+-DCMAKE_CXX_INCLUDE_WHAT_YOU_USE="$UWYU_COMMAND" \
+-DBUILD_SHARED_LIBS=ON \
+-DBUILD_TESTS=ON
+
+make clean					# Clean up to generate the full report
+time make -k 2>&1 | tee "$RESULT"		# Run the scan. -k means: ignore errors
+#time make -k easylogging 2>&1 | tee $RESULT	# Quick testing: build a single target
+KPI=$(cat "$RESULT" | wc -l)
+tar -cJvf "$RESULT.txz" "$RESULT"		# Zip the result, because it's huge.
+rm -v "$RESULT"
+
+echo ""
+echo "Readable result stored in: $DIR_BUILD/$RESULT.gz"
+
+echo "$KPI" > "kpis.txt"

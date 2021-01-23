@@ -51,14 +51,6 @@
 #undef MONERO_DEFAULT_LOG_CATEGORY
 #define MONERO_DEFAULT_LOG_CATEGORY "net.p2p.tx"
 
-namespace
-{
-  int get_command_from_message(const epee::byte_slice &msg)
-  {
-    return msg.size() >= sizeof(epee::levin::bucket_head2) ? SWAP32LE(((epee::levin::bucket_head2*)msg.data())->m_command) : 0;
-  }
-}
-
 namespace cryptonote
 {
 namespace levin
@@ -212,7 +204,7 @@ namespace levin
     {
       const epee::byte_slice blob = make_tx_payload(std::move(txs), pad, fluff);
       p2p.for_connection(destination, [&blob](detail::p2p_context& context) {
-        on_levin_traffic(context, true, true, false, blob.size(), get_command_from_message(blob));
+        on_levin_traffic(context, true, true, false, blob.size(), NOTIFY_NEW_TRANSACTIONS::ID);
         return true;
       });
       return p2p.notify(NOTIFY_NEW_TRANSACTIONS::ID, epee::to_span(blob), destination);
@@ -443,7 +435,7 @@ namespace levin
         zone->p2p->foreach_connection([txs, now, &zone, &source, &in_duration, &out_duration, &next_flush] (detail::p2p_context& context)
         {
           // When i2p/tor, only fluff to outbound connections
-          if (source != context.m_connection_id && (zone->nzone == epee::net_utils::zone::public_ || !context.m_is_income))
+          if (context.handshake_complete() && source != context.m_connection_id && (zone->nzone == epee::net_utils::zone::public_ || !context.m_is_income))
           {
             if (context.fluff_txs.empty())
               context.flush_time = now + (context.m_is_income ? in_duration() : out_duration());
